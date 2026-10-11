@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Touch Grass Card — a tiny local AI that sends you outside</title>
+<style>
+  :root { --grass:#2e7d32; --grass-dark:#1b5e20; --paper:#fffdf5; --ink:#22301f; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: linear-gradient(180deg, #e8f5e9, #f7fbf3); color: var(--ink); }
+  main { max-width: 680px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 2rem; margin: 8px 0 4px; }
+  .sub { color:#45603f; margin-top:0; line-height:1.5; }
+  .controls { background: var(--paper); border:1px solid #cfe3c8; border-radius:14px;
+              padding:16px; display:grid; gap:10px; box-shadow: 0 2px 10px rgba(46,125,50,.08); }
+  label { font-size:.9rem; display:flex; justify-content:space-between; gap:12px; align-items:center; }
+  input, select { font: inherit; padding:6px 8px; border:1px solid #b9d3b0; border-radius:8px; background:#fff; }
+  button { font: inherit; font-weight:600; border:0; border-radius:10px; padding:12px 16px;
+           background: var(--grass); color:#fff; cursor:pointer; }
+  button:hover { background: var(--grass-dark); }
+  button:disabled { opacity:.55; cursor:wait; }
+  button.ghost { background:#e3efe0; color:var(--grass-dark); }
+  #status { font-size:.85rem; color:#5b7555; min-height:1.2em; margin:0; }
+  progress { width:100%; height:8px; }
+  #card { margin-top:18px; background:var(--paper); border:2px dashed var(--grass); border-radius:16px; padding:20px; }
+  #card h2 { margin-top:0; }
+  #card h3 { margin-bottom:4px; color:var(--grass-dark); }
+  #card ul { margin-top:0; }
+  .row { display:flex; gap:10px; margin-top:16px; flex-wrap:wrap; }
+  #counter { text-align:center; color:#5b7555; font-size:.9rem; }
+  footer { text-align:center; color:#7a9377; font-size:.8rem; margin-top:32px; line-height:1.6; }
+  .raw { white-space:pre-wrap; font-size:.85rem; color:#687d64; }
+</style>
+</head>
+<body>
+<main>  <h1>🌿 Touch Grass Card</h1>
+  <p class="sub">A 270M-parameter <strong>Gemma 3</strong> runs <strong>100% in your browser</strong> —
+     no server, no account, no API key. It deals you one small outdoor mission.
+     Your only job: put the phone away and go do it.</p>  <section class="controls">
+    <label>Where are you?
+      <input id="place" value="Corvallis, Oregon" size="18" />
+    </label>
+    <label>Time you can spare      <select id="minutes">
+        <option>15</option>
+        <option selected>30</option>
+        <option>45</option>
+        <option>60</option>
+      </select>
+    </label>
+    <label>Vibe
+      <select id="vibe">
+        <option selected>chill</option>
+        <option>adventurous</option>
+        <option>curious</option>
+        <option>social</option>
+      </select>
+    </label>
+    <button id="go">🎴 Draw a mission card</button>
+    <p id="status">Model not loaded yet — first load downloads it (~1&nbsp;GB, fp32 — see note in code on why q4f16/WebGPU is avoided). After that it is cached and works offline.</p>    <progress id="bar" value="0" max="100" hidden></progress>
+  </section>
+
+  <article id="card" hidden>
+    <h2 id="c-title"></h2>
+    <p id="c-mission"></p>
+    <h3>👀 Look for</h3>
+    <ul id="c-look"></ul>
+    <h3>📸 Proof</h3>
+    <p id="c-proof"></p>    <p class="raw" id="c-raw" hidden></p>
+    <div class="row">
+      <button id="done">✅ I went outside and did it</button>
+      <button id="again" class="ghost">🔀 New card</button>
+    </div>
+  </article>  <p id="counter"></p>
+
+  <footer>
+    Built with <a href="https://ai.google.dev/gemma">Gemma 3 270M</a> (open weights) +
+    <a href="https://huggingface.co/docs/transformers.js">Transformers.js</a>.
+    Inference happens on your device — after the first download, this page works on a trail with zero signal.<br/>
+    A Hacktoberfest “Touch Grass” micro-project.
+  </footer>
+</main><script type="module">
+import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/dist/transformers.min.js';
+
+// ---------- EDIT THESE to make it yours ----------
+const MODEL_ID = 'onnx-community/gemma-3-270m-it-ONNX';
+const SYSTEM = `You are a tiny outdoor-mission generator. You invent ONE small, safe, real-world mission that gets a person off their phone and outside. Keep it simple, friendly and doable. Never suggest anything dangerous, illegal, or on private property. Always answer in exactly this format:
+Title: <short catchy title>
+Mission: <2-3 sentences saying exactly what to do>
+Look for: <three things to notice, separated by commas>
+Proof: <one photo to take as proof>`;
+// -------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status'), bar = $('bar'), goBtn = $('go');
+let generator = null;
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+async function loadModel() {
+  if (generator) return generator;
+  const onProgress = (p) => {
+    if (p.status === 'progress' && p.total) {
+      bar.hidden = false;
+      bar.value = Math.round((p.loaded / p.total) * 100);
+      setStatus(`Downloading model… ${bar.value}% (one-time, cached afterwards)`);    }
+  };
+  try {
+    // NOTE (fixed 2026-10-08): do NOT use q4f16/fp16 on WebGPU for this model.
+    // ONNX Runtime WebGPU fp16 path has a known overflow bug for
+    // gemma-3-270m-it-ONNX (microsoft/onnxruntime#26732) that makes it emit
+    // repeated <unused56> tokens instead of text, with no exception thrown.
+    // fp32 is the verified-working dtype on both WebGPU and WASM.
+    generator = await pipeline('text-generation', MODEL_ID, {
+      device: 'webgpu', dtype: 'fp32', progress_callback: onProgress });
+    setStatus('Model ready (WebGPU, fp32). Everything runs on this device.');
+  } catch (e) {
+    // Fallback: plain WASM/CPU with fp32 — also verified working for this model.
+    setStatus('WebGPU unavailable — falling back to WASM (fp32)…');
+    generator = await pipeline('text-generation', MODEL_ID, { device: 'wasm', dtype: 'fp32', progress_callback: onProgress });
+    setStatus('Model ready (WASM, fp32). Everything runs on this device.');
+  }
+  bar.hidden = true;  return generator;
+}
+function parseCard(text) {
+  const fields = {}; let cur = null;
+  for (const line of text.split('\n')) {
+    const m = line.match(/^(Title|Mission|Look for|Proof)\s*:\s*(.*)$/i);
+    if (m) { cur = m[1].toLowerCase(); fields[cur] = m[2].trim(); }
+    else if (cur && line.trim()) fields[cur] += ' ' + line.trim();
+  }
+  return fields;
+}function showCard(fields, raw) {  $('card').hidden = false;
+  $('c-raw').hidden = true;
+  $('c-title').textContent = fields.title || 'Your mission';
+  $('c-mission').textContent = fields.mission || '';
+  $('c-proof').textContent = fields.proof || '';
+  const ul = $('c-look'); ul.innerHTML = '';
+  (fields['look for'] || '').split(',').map(s => s.trim()).filter(Boolean)
+    .forEach(item => { const li = document.createElement('li'); li.textContent = item; ul.appendChild(li); });
+  if (!fields.title && !fields.mission) { // model went off-script — show raw text rather than nothing
+    $('c-raw').hidden = false;
+    $('c-raw').textContent = raw;
+  }
+  updateCounter();}
+
+function updateCounter() {
+  const n = Number(localStorage.getItem('tgc-done') || 0);
+  $('counter').textContent = n ? `🌱 Missions completed on this device: ${n}` : '';
+}
+
+async function draw() {
+  goBtn.disabled = true;  try {
+    const gen = await loadModel();
+    setStatus('Dealing your card…');
+    const user = `Place: ${$('place').value || 'a small college town'}. Time available: ${$('minutes').value} minutes. Vibe: ${$('vibe').value}. Season: early October, fall colors starting. Invent one mission.`;
+    const out = await gen(
+      [{ role: 'system', content: SYSTEM }, { role: 'user', content: user }],
+      { max_new_tokens: 180, do_sample: true, temperature: 0.9, top_p: 0.95 }
+    );
+    const last = Array.isArray(out[0].generated_text)
+      ? out[0].generated_text.at(-1).content
+      : String(out[0].generated_text);
+    // Safety net for the WebGPU fp16 overflow bug: if the model emits
+    // repeated unused tokens, surface it instead of showing a blank card.
+    if (/(<unused\d+>\s*){3,}/.test(last)) {
+      $('card').hidden = false;
+      $('c-raw').hidden = false;
+      $('c-raw').textContent = last;      setStatus('Model produced garbage tokens (known WebGPU fp16 bug). Reload and let it use the fp32 path, or try a browser without WebGPU so it falls back to WASM.');
+      return;
+    }
+    showCard(parseCard(last), last);
+    setStatus('Card dealt. Now the hard part: actually go outside. 🌤️');
+  } catch (err) {
+    console.error(err);
+    setStatus('Something went wrong loading or running the model — check the console and try again.');
+  } finally {
+    goBtn.disabled = false;
+  }
+}
+
+goBtn.addEventListener('click', draw);
+$('again').addEventListener('click', draw);
+$('done').addEventListener('click', () => {
+  localStorage.setItem('tgc-done', Number(localStorage.getItem('tgc-done') || 0) + 1);
+  updateCounter();
+});
+updateCounter();
+</script>
+</body>
+</html>
